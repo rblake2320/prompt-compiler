@@ -13,6 +13,7 @@ export default defineConfig(({ mode }) => {
           headers: {
             'x-api-key': env.ANTHROPIC_API_KEY || '',
             'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
           },
         },
       },
