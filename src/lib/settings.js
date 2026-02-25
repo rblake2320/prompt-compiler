@@ -32,18 +32,53 @@ export const PROVIDER_CONFIGS = {
     ],
     defaultModel: 'llama-3.3-70b-versatile',
   },
+  gemini: {
+    name: 'Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    proxyPath: '/api/proxy/gemini',
+    authType: 'bearer',
+    models: [
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-lite',
+      'gemini-1.5-pro',
+      'gemini-1.5-flash',
+      'gemini-1.5-flash-8b',
+    ],
+    defaultModel: 'gemini-2.0-flash',
+  },
 };
 
-const DEFAULTS = { provider: 'anthropic', model: '', apiKey: '' };
+const SETTINGS_DEFAULTS = { provider: 'anthropic', model: '', apiKey: '' };
 
 export function getSettings() {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('pc_settings') || '{}') };
+    return { ...SETTINGS_DEFAULTS, ...JSON.parse(localStorage.getItem('pc_settings') || '{}') };
   } catch {
-    return { ...DEFAULTS };
+    return { ...SETTINGS_DEFAULTS };
   }
 }
 
 export function saveSettings(settings) {
   localStorage.setItem('pc_settings', JSON.stringify(settings));
+}
+
+export function getActiveLayers() {
+  try {
+    const v = localStorage.getItem('pc_active_layers');
+    return v ? JSON.parse(v) : null;
+  } catch { return null; }
+}
+
+export function saveActiveLayers(keys) {
+  localStorage.setItem('pc_active_layers', JSON.stringify(keys));
+}
+
+export function getCustomLayers() {
+  try {
+    return JSON.parse(localStorage.getItem('pc_custom_layers') || '[]');
+  } catch { return []; }
+}
+
+export function saveCustomLayers(layers) {
+  localStorage.setItem('pc_custom_layers', JSON.stringify(layers));
 }

@@ -1,7 +1,15 @@
 const PROVIDER_TARGETS = {
-  anthropic: { base: 'https://api.anthropic.com', authType: 'anthropic' },
-  openai:    { base: 'https://api.openai.com',    authType: 'bearer'    },
-  groq:      { base: 'https://api.groq.com/openai', authType: 'bearer'  },
+  anthropic: { base: 'https://api.anthropic.com',                        authType: 'anthropic' },
+  openai:    { base: 'https://api.openai.com',                           authType: 'bearer'    },
+  groq:      { base: 'https://api.groq.com/openai',                      authType: 'bearer'    },
+  gemini:    { base: 'https://generativelanguage.googleapis.com/v1beta/openai', authType: 'bearer' },
+};
+
+const SERVER_KEYS = {
+  anthropic: (env) => env.ANTHROPIC_API_KEY,
+  openai:    (env) => env.OPENAI_API_KEY,
+  groq:      (env) => env.GROQ_API_KEY,
+  gemini:    (env) => env.GEMINI_API_KEY,
 };
 
 export async function onRequest({ request, env, params }) {
@@ -26,16 +34,17 @@ export async function onRequest({ request, env, params }) {
   headers.delete('anthropic-dangerous-direct-browser-access');
 
   if (target.authType === 'anthropic') {
-    if (!headers.has('x-api-key') && env.ANTHROPIC_API_KEY) {
-      headers.set('x-api-key', env.ANTHROPIC_API_KEY);
+    if (!headers.has('x-api-key')) {
+      const key = SERVER_KEYS[provider]?.(env);
+      if (key) headers.set('x-api-key', key);
     }
     if (!headers.has('anthropic-version')) {
       headers.set('anthropic-version', '2023-06-01');
     }
   } else {
     if (!headers.has('Authorization')) {
-      const serverKey = provider === 'openai' ? env.OPENAI_API_KEY : env.GROQ_API_KEY;
-      if (serverKey) headers.set('Authorization', `Bearer ${serverKey}`);
+      const key = SERVER_KEYS[provider]?.(env);
+      if (key) headers.set('Authorization', `Bearer ${key}`);
     }
   }
 

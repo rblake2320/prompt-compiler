@@ -27,10 +27,17 @@ export default defineConfig(({ mode }) => {
         '/api/proxy/groq': {
           target: 'https://api.groq.com',
           changeOrigin: true,
-          // rewrite strips /api/proxy/groq and prepends /openai (Groq's base path)
           rewrite: (p) => p.replace(/^\/api\/proxy\/groq/, '/openai'),
           ...(env.GROQ_API_KEY && {
             headers: { Authorization: `Bearer ${env.GROQ_API_KEY}` },
+          }),
+        },
+        '/api/proxy/gemini': {
+          target: 'https://generativelanguage.googleapis.com',
+          changeOrigin: true,
+          rewrite: (p) => p.replace(/^\/api\/proxy\/gemini/, '/v1beta/openai'),
+          ...(env.GEMINI_API_KEY && {
+            headers: { Authorization: `Bearer ${env.GEMINI_API_KEY}` },
           }),
         },
       },
