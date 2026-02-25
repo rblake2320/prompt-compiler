@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
-import { callClaude, callClaudeWithHistory, robustJsonParse } from '../lib/claude';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { callClaude, streamClaudeWithHistory, robustJsonParse } from '../lib/claude';
 import {
   buildDecomposeSystem,
   buildSynthesizeSystem,
@@ -41,7 +41,9 @@ export default function PromptCompiler() {
 
   // Execution state
   const [conversation, setConversation] = useState([]);
+  const [streamingText, setStreamingText] = useState('');
   const [runLoading, setRunLoading] = useState(false);
+  const abortRef = useRef(null);
 
   // Layer config
   const [customLayers, setCustomLayers] = useState(getCustomLayers);
@@ -57,6 +59,11 @@ export default function PromptCompiler() {
   );
 
   useEffect(() => { setHistory(loadHistory()); }, []);
+
+  // Cleanup abort controller on unmount
+  useEffect(() => {
+    return () => { if (abortRef.current) abortRef.current.abort(); };
+  }, []);
 
   // Layer selection helpers
   const toggleLayer = useCallback((key) => {
@@ -135,6 +142,7 @@ export default function PromptCompiler() {
     setActiveTab('layers');
     setShowHistory(false);
     setConversation([]);
+    setStreamingText('');
     if (entry.layerKeys) {
       setSelectedKeys(entry.layerKeys);
       saveActiveLayers(entry.layerKeys);
@@ -189,6 +197,7 @@ export default function PromptCompiler() {
     setCopied(false);
     setLayersEdited(false);
     setConversation([]);
+    setStreamingText('');
     try {
       setPhase(`Phase 1/2 \u2014 Decomposing into ${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'}\u2026`);
       const rawLayers = await callClaude(buildDecomposeSystem(activeLayers), 'Task/Goal:\n' + input);
@@ -218,39 +227,92 @@ export default function PromptCompiler() {
     finally { setResynthLoading(false); }
   }, [layers, input, activeLayers]);
 
-  // Run compiled prompt
+  // Run compiled prompt (streaming)
   const runPrompt = useCallback(async () => {
     if (!synthesized || !input.trim()) return;
+    // Abort any in-flight stream
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setRunLoading(true);
     setError('');
+    setStreamingText('');
     const userMsg = { role: 'user', content: input };
     const newConvo = [userMsg];
     setConversation(newConvo);
     setActiveTab('output');
+
+    let accumulated = '';
     try {
-      const response = await callClaudeWithHistory(synthesized, newConvo);
-      setConversation([userMsg, { role: 'assistant', content: response }]);
-    } catch (e) { setError(e.message); }
-    finally { setRunLoading(false); }
+      const fullText = await streamClaudeWithHistory(
+        synthesized,
+        newConvo,
+        (chunk) => {
+          accumulated += chunk;
+          setStreamingText(accumulated);
+        },
+        controller.signal
+      );
+      // Commit final response to conversation, clear streaming
+      setConversation([userMsg, { role: 'assistant', content: fullText }]);
+      setStreamingText('');
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(e.message);
+      // If we got partial text, commit it
+      if (accumulated) {
+        setConversation([userMsg, { role: 'assistant', content: accumulated }]);
+        setStreamingText('');
+      }
+    } finally {
+      setRunLoading(false);
+      abortRef.current = null;
+    }
   }, [synthesized, input]);
 
-  // Send follow-up in conversation
+  // Send follow-up in conversation (streaming)
   const sendFollowUp = useCallback(async (text) => {
     if (!text.trim() || !synthesized) return;
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setRunLoading(true);
     setError('');
+    setStreamingText('');
     const userMsg = { role: 'user', content: text };
     const updatedConvo = [...conversation, userMsg];
     setConversation(updatedConvo);
+
+    let accumulated = '';
     try {
-      const response = await callClaudeWithHistory(synthesized, updatedConvo);
-      setConversation([...updatedConvo, { role: 'assistant', content: response }]);
-    } catch (e) { setError(e.message); }
-    finally { setRunLoading(false); }
+      const fullText = await streamClaudeWithHistory(
+        synthesized,
+        updatedConvo,
+        (chunk) => {
+          accumulated += chunk;
+          setStreamingText(accumulated);
+        },
+        controller.signal
+      );
+      setConversation([...updatedConvo, { role: 'assistant', content: fullText }]);
+      setStreamingText('');
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(e.message);
+      if (accumulated) {
+        setConversation([...updatedConvo, { role: 'assistant', content: accumulated }]);
+        setStreamingText('');
+      }
+    } finally {
+      setRunLoading(false);
+      abortRef.current = null;
+    }
   }, [conversation, synthesized]);
 
   const clearConversation = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
     setConversation([]);
+    setStreamingText('');
   }, []);
 
   const handleLayerSave = useCallback((key, draft) => {
@@ -259,6 +321,7 @@ export default function PromptCompiler() {
   }, []);
 
   const reset = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
     setLayers(null);
     setSynthesized('');
     setError('');
@@ -267,6 +330,7 @@ export default function PromptCompiler() {
     setActiveTab('layers');
     setCopied(false);
     setConversation([]);
+    setStreamingText('');
   }, []);
 
   const copyToClipboard = useCallback((text) => {
@@ -551,7 +615,7 @@ export default function PromptCompiler() {
               {[
                 { id: 'layers', label: `\ud83e\udde9 ${activeLayers.length} Layer${activeLayers.length === 1 ? '' : 's'}`, ready: !!layers },
                 { id: 'synthesized', label: '\u26a1 Compiled Prompt', ready: !!synthesized },
-                { id: 'output', label: '\ud83d\ude80 Output', ready: conversation.length > 0 },
+                { id: 'output', label: '\ud83d\ude80 Output', ready: conversation.length > 0 || !!streamingText },
               ].map(tab => (
                 <button
                   key={tab.id}
@@ -630,6 +694,7 @@ export default function PromptCompiler() {
             {activeTab === 'output' && (
               <OutputView
                 conversation={conversation}
+                streamingText={streamingText}
                 onSendFollowUp={sendFollowUp}
                 onClear={clearConversation}
                 loading={runLoading}

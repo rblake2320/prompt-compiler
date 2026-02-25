@@ -51,6 +51,7 @@ function MessageBubble({ role, content }) {
 
 export default function OutputView({
   conversation,
+  streamingText,
   onSendFollowUp,
   onClear,
   loading,
@@ -59,12 +60,12 @@ export default function OutputView({
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
 
-  // Auto-scroll to bottom on new messages
+  // Auto-scroll to bottom on new messages or streaming updates
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [conversation, loading]);
+  }, [conversation, streamingText, loading]);
 
   const handleSend = useCallback(() => {
     if (!followUp.trim() || loading) return;
@@ -87,11 +88,11 @@ export default function OutputView({
     navigator.clipboard.writeText(text);
   }, [conversation]);
 
-  if (conversation.length === 0) {
+  if (conversation.length === 0 && !streamingText) {
     return (
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 text-center">
-        <div className="text-3xl mb-3">🚀</div>
-        <p className="text-sm text-gray-400">Click "Run Prompt" on the Compiled Prompt tab to execute your prompt</p>
+        <div className="text-3xl mb-3">\ud83d\ude80</div>
+        <p className="text-sm text-gray-400">Click \"Run Prompt\" on the Compiled Prompt tab to execute your prompt</p>
       </div>
     );
   }
@@ -105,13 +106,19 @@ export default function OutputView({
           <span className="text-xs bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded-full">
             {conversation.filter((m) => m.role === 'assistant').length} response{conversation.filter((m) => m.role === 'assistant').length !== 1 ? 's' : ''}
           </span>
+          {loading && (
+            <span className="flex items-center gap-1 text-xs text-cyan-400">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+              Streaming
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           <button
             onClick={copyAll}
             className="text-xs px-2 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 transition-colors"
           >
-            📋 Copy All
+            \ud83d\udccb Copy All
           </button>
           <button
             onClick={onClear}
@@ -127,13 +134,17 @@ export default function OutputView({
         {conversation.map((msg, i) => (
           <MessageBubble key={i} role={msg.role} content={msg.content} />
         ))}
-        {loading && (
+        {/* Live streaming text (not yet committed to conversation) */}
+        {streamingText && (
+          <MessageBubble role="assistant" content={streamingText} />
+        )}
+        {loading && !streamingText && (
           <div className="flex items-center gap-2 text-sm text-gray-500">
             <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
-            Generating…
+            Connecting\u2026
           </div>
         )}
       </div>
@@ -146,7 +157,7 @@ export default function OutputView({
             value={followUp}
             onChange={(e) => setFollowUp(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Follow-up message… (Enter to send, Shift+Enter for newline)"
+            placeholder="Follow-up message\u2026 (Enter to send, Shift+Enter for newline)"
             rows={1}
             className="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 resize-none focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
             style={{ minHeight: '38px', maxHeight: '120px' }}
