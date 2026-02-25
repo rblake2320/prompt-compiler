@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
-import { callClaude, robustJsonParse } from '../lib/claude';
+import { callClaude, callClaudeWithHistory, robustJsonParse } from '../lib/claude';
 import {
   buildDecomposeSystem,
   buildSynthesizeSystem,
@@ -14,6 +14,7 @@ import {
 import Settings from './Settings';
 import LayerCard from './LayerCard';
 import AddLayerModal from './AddLayerModal';
+import OutputView from './OutputView';
 
 function loadHistory() {
   try { return JSON.parse(localStorage.getItem('pc_history') || '[]'); }
@@ -37,6 +38,10 @@ export default function PromptCompiler() {
   const [showSettings, setShowSettings] = useState(false);
   const [showAddLayer, setShowAddLayer] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+
+  // Execution state
+  const [conversation, setConversation] = useState([]);
+  const [runLoading, setRunLoading] = useState(false);
 
   // Layer config
   const [customLayers, setCustomLayers] = useState(getCustomLayers);
@@ -129,6 +134,7 @@ export default function PromptCompiler() {
     setLayersEdited(false);
     setActiveTab('layers');
     setShowHistory(false);
+    setConversation([]);
     if (entry.layerKeys) {
       setSelectedKeys(entry.layerKeys);
       saveActiveLayers(entry.layerKeys);
@@ -182,12 +188,13 @@ export default function PromptCompiler() {
     setActiveTab('layers');
     setCopied(false);
     setLayersEdited(false);
+    setConversation([]);
     try {
-      setPhase(`Phase 1/2 — Decomposing into ${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'}…`);
+      setPhase(`Phase 1/2 \u2014 Decomposing into ${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'}\u2026`);
       const rawLayers = await callClaude(buildDecomposeSystem(activeLayers), 'Task/Goal:\n' + input);
       const parsed = robustJsonParse(rawLayers);
       setLayers(parsed);
-      setPhase('Phase 2/2 — Synthesizing compiled prompt…');
+      setPhase('Phase 2/2 \u2014 Synthesizing compiled prompt\u2026');
       const synthInput = 'Original task: ' + input + '\n\nLayer Decomposition:\n' + JSON.stringify(parsed, null, 2);
       const rawSynth = await callClaude(buildSynthesizeSystem(activeLayers), synthInput);
       setSynthesized(rawSynth.trim());
@@ -211,6 +218,41 @@ export default function PromptCompiler() {
     finally { setResynthLoading(false); }
   }, [layers, input, activeLayers]);
 
+  // Run compiled prompt
+  const runPrompt = useCallback(async () => {
+    if (!synthesized || !input.trim()) return;
+    setRunLoading(true);
+    setError('');
+    const userMsg = { role: 'user', content: input };
+    const newConvo = [userMsg];
+    setConversation(newConvo);
+    setActiveTab('output');
+    try {
+      const response = await callClaudeWithHistory(synthesized, newConvo);
+      setConversation([userMsg, { role: 'assistant', content: response }]);
+    } catch (e) { setError(e.message); }
+    finally { setRunLoading(false); }
+  }, [synthesized, input]);
+
+  // Send follow-up in conversation
+  const sendFollowUp = useCallback(async (text) => {
+    if (!text.trim() || !synthesized) return;
+    setRunLoading(true);
+    setError('');
+    const userMsg = { role: 'user', content: text };
+    const updatedConvo = [...conversation, userMsg];
+    setConversation(updatedConvo);
+    try {
+      const response = await callClaudeWithHistory(synthesized, updatedConvo);
+      setConversation([...updatedConvo, { role: 'assistant', content: response }]);
+    } catch (e) { setError(e.message); }
+    finally { setRunLoading(false); }
+  }, [conversation, synthesized]);
+
+  const clearConversation = useCallback(() => {
+    setConversation([]);
+  }, []);
+
   const handleLayerSave = useCallback((key, draft) => {
     setLayers(prev => ({ ...prev, [key]: draft }));
     setLayersEdited(true);
@@ -224,6 +266,7 @@ export default function PromptCompiler() {
     setLayersEdited(false);
     setActiveTab('layers');
     setCopied(false);
+    setConversation([]);
   }, []);
 
   const copyToClipboard = useCallback((text) => {
@@ -241,7 +284,7 @@ export default function PromptCompiler() {
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   };
 
-  const truncate = (s, n) => s.length > n ? s.slice(0, n) + '…' : s;
+  const truncate = (s, n) => s.length > n ? s.slice(0, n) + '\u2026' : s;
 
   const hasResults = !!(layers || synthesized);
 
@@ -319,7 +362,7 @@ export default function PromptCompiler() {
                     <div className="flex-1 min-w-0 cursor-pointer" onClick={() => loadEntry(entry)}>
                       <p className="text-sm text-gray-200 truncate">{truncate(entry.input, 80)}</p>
                       <p className="text-xs text-gray-500 mt-0.5">
-                        {formatDate(entry.timestamp)} · {entry.layerKeys?.length || 6} layers · {entry.synthesized?.length?.toLocaleString() || 0} chars
+                        {formatDate(entry.timestamp)} \u00b7 {entry.layerKeys?.length || 6} layers \u00b7 {entry.synthesized?.length?.toLocaleString() || 0} chars
                       </p>
                     </div>
                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -356,7 +399,7 @@ export default function PromptCompiler() {
             <textarea
               value={input}
               onChange={e => setInput(e.target.value)}
-              placeholder='e.g. "Build an AI agent that monitors Jira tickets, triages by severity, drafts responses, and escalates critical issues to Slack…"'
+              placeholder='e.g. "Build an AI agent that monitors Jira tickets, triages by severity, drafts responses, and escalates critical issues to Slack\u2026"'
               className="w-full bg-gray-950 border border-gray-700 rounded-lg p-3 text-gray-100 placeholder-gray-600 resize-none focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
               rows={4}
               onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) compile(); }}
@@ -372,7 +415,7 @@ export default function PromptCompiler() {
                 </span>
                 <div className="flex gap-2">
                   <button onClick={selectAll} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">All</button>
-                  <span className="text-gray-700">·</span>
+                  <span className="text-gray-700">\u00b7</span>
                   <button onClick={selectNone} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Min</button>
                 </div>
               </div>
@@ -397,7 +440,7 @@ export default function PromptCompiler() {
                           onClick={() => deleteCustomLayer(meta.key)}
                           className="ml-0.5 w-4 h-4 flex items-center justify-center rounded-full text-gray-600 hover:text-red-400 hover:bg-red-900/30 transition-colors text-xs"
                           title={`Remove ${meta.label}`}
-                        >×</button>
+                        >\u00d7</button>
                       )}
                     </div>
                   );
@@ -436,7 +479,7 @@ export default function PromptCompiler() {
                     </svg>
                     {phase}
                   </span>
-                ) : `⚡ Compile (${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'})`}
+                ) : `\u26a1 Compile (${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'})`}
               </button>
             </div>
           </div>
@@ -447,7 +490,7 @@ export default function PromptCompiler() {
           <div className="bg-red-950 border border-red-800 rounded-lg p-3 text-red-300 text-sm flex items-start gap-2">
             <span className="font-semibold shrink-0">Error:</span>
             <span>{error}</span>
-            <button onClick={() => setError('')} className="ml-auto shrink-0 text-red-500 hover:text-red-300">✕</button>
+            <button onClick={() => setError('')} className="ml-auto shrink-0 text-red-500 hover:text-red-300">\u2715</button>
           </div>
         )}
 
@@ -476,7 +519,7 @@ export default function PromptCompiler() {
                       </svg>
                       {phase}
                     </span>
-                  ) : '⚡ Re-compile'}
+                  ) : '\u26a1 Re-compile'}
                 </button>
               </div>
             </div>
@@ -484,7 +527,7 @@ export default function PromptCompiler() {
             {/* Re-synthesize notice */}
             {layersEdited && (
               <div className="flex items-center justify-between bg-amber-950/40 border border-amber-800/40 rounded-lg px-3 py-2.5">
-                <span className="text-xs text-amber-300">Layers edited — synthesized prompt is out of date</span>
+                <span className="text-xs text-amber-300">Layers edited \u2014 synthesized prompt is out of date</span>
                 <button
                   onClick={resynthesize}
                   disabled={resynthLoading}
@@ -496,9 +539,9 @@ export default function PromptCompiler() {
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/>
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
                       </svg>
-                      Synthesizing…
+                      Synthesizing\u2026
                     </span>
-                  ) : '↻ Re-synthesize'}
+                  ) : '\u21bb Re-synthesize'}
                 </button>
               </div>
             )}
@@ -506,8 +549,9 @@ export default function PromptCompiler() {
             {/* Tabs */}
             <div className="flex gap-2 bg-gray-900 rounded-lg p-1 w-fit">
               {[
-                { id: 'layers', label: `🧩 ${activeLayers.length} Layer${activeLayers.length === 1 ? '' : 's'}`, ready: !!layers },
-                { id: 'synthesized', label: '⚡ Compiled Prompt', ready: !!synthesized },
+                { id: 'layers', label: `\ud83e\udde9 ${activeLayers.length} Layer${activeLayers.length === 1 ? '' : 's'}`, ready: !!layers },
+                { id: 'synthesized', label: '\u26a1 Compiled Prompt', ready: !!synthesized },
+                { id: 'output', label: '\ud83d\ude80 Output', ready: conversation.length > 0 },
               ].map(tab => (
                 <button
                   key={tab.id}
@@ -550,24 +594,51 @@ export default function PromptCompiler() {
                     <span className="text-sm font-semibold text-gray-300">Production-Ready Prompt</span>
                     <span className="text-xs bg-emerald-900/50 text-emerald-400 px-2 py-0.5 rounded-full">{synthesized.length.toLocaleString()} chars</span>
                   </div>
-                  <button
-                    onClick={() => copyToClipboard(synthesized)}
-                    className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-1.5 ${
-                      copied ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-800 hover:bg-gray-700 text-gray-300'
-                    }`}
-                  >
-                    {copied ? '✓ Copied!' : '📋 Copy Prompt'}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={runPrompt}
+                      disabled={runLoading}
+                      className="px-3 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white disabled:opacity-50"
+                    >
+                      {runLoading ? (
+                        <span className="flex items-center gap-1.5">
+                          <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                          </svg>
+                          Running\u2026
+                        </span>
+                      ) : '\ud83d\ude80 Run Prompt'}
+                    </button>
+                    <button
+                      onClick={() => copyToClipboard(synthesized)}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-1.5 ${
+                        copied ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-800 hover:bg-gray-700 text-gray-300'
+                      }`}
+                    >
+                      {copied ? '\u2713 Copied!' : '\ud83d\udccb Copy'}
+                    </button>
+                  </div>
                 </div>
                 <pre className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed bg-gray-950 rounded-lg p-4 border border-gray-800 max-h-[32rem] overflow-y-auto font-mono selection:bg-violet-500/30">
                   {synthesized}
                 </pre>
               </div>
             )}
+
+            {/* Output Tab */}
+            {activeTab === 'output' && (
+              <OutputView
+                conversation={conversation}
+                onSendFollowUp={sendFollowUp}
+                onClear={clearConversation}
+                loading={runLoading}
+              />
+            )}
           </div>
         )}
 
-        {/* Idle — layer stack preview */}
+        {/* Idle \u2014 layer stack preview */}
         {!hasResults && !loading && (
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
             <p className="text-xs text-gray-500 uppercase tracking-wider mb-4 font-semibold">Active Layer Stack</p>
@@ -598,7 +669,7 @@ export default function PromptCompiler() {
               )}
             </div>
             <div className="mt-5 pt-4 border-t border-gray-800">
-              <p className="text-xs text-gray-600">Two-phase compilation: structured JSON decomposition → plain-text synthesis</p>
+              <p className="text-xs text-gray-600">Two-phase compilation: structured JSON decomposition \u2192 plain-text synthesis</p>
             </div>
           </div>
         )}
