@@ -1,5 +1,6 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import CodeBlock from './CodeBlock';
+import PreviewAssembler, { countPreviewableBlocks } from './PreviewAssembler';
 
 // Parse AI response into segments of text and code blocks
 function parseContent(text) {
@@ -57,8 +58,15 @@ export default function OutputView({
   loading,
 }) {
   const [followUp, setFollowUp] = useState('');
+  const [showPreview, setShowPreview] = useState(false);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+
+  // Count previewable blocks
+  const previewCount = useMemo(
+    () => countPreviewableBlocks(conversation),
+    [conversation]
+  );
 
   // Auto-scroll to bottom on new messages or streaming updates
   useEffect(() => {
@@ -80,13 +88,22 @@ export default function OutputView({
     }
   }, [handleSend]);
 
-  // Copy entire conversation as text
   const copyAll = useCallback(() => {
     const text = conversation
       .map((m) => `[${m.role.toUpperCase()}]\n${m.content}`)
       .join('\n\n---\n\n');
     navigator.clipboard.writeText(text);
   }, [conversation]);
+
+  // Full-screen preview mode
+  if (showPreview) {
+    return (
+      <PreviewAssembler
+        conversation={conversation}
+        onClose={() => setShowPreview(false)}
+      />
+    );
+  }
 
   if (conversation.length === 0 && !streamingText) {
     return (
@@ -114,6 +131,17 @@ export default function OutputView({
           )}
         </div>
         <div className="flex items-center gap-1.5">
+          {/* RUN & TEST BUTTON */}
+          {previewCount > 0 && !loading && (
+            <button
+              onClick={() => setShowPreview(true)}
+              className="text-xs px-3 py-1.5 rounded-md bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-semibold transition-all flex items-center gap-1.5 shadow-lg shadow-emerald-900/30"
+            >
+              <span>\u25b6</span>
+              Run &amp; Test
+              <span className="bg-white/20 px-1.5 py-0 rounded text-[10px] font-bold">{previewCount}</span>
+            </button>
+          )}
           <button
             onClick={copyAll}
             className="text-xs px-2 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 transition-colors"
@@ -134,7 +162,6 @@ export default function OutputView({
         {conversation.map((msg, i) => (
           <MessageBubble key={i} role={msg.role} content={msg.content} />
         ))}
-        {/* Live streaming text (not yet committed to conversation) */}
         {streamingText && (
           <MessageBubble role="assistant" content={streamingText} />
         )}
@@ -145,6 +172,19 @@ export default function OutputView({
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             Connecting\u2026
+          </div>
+        )}
+
+        {/* Inline preview hint after streaming completes */}
+        {!loading && !streamingText && previewCount > 0 && (
+          <div className="flex justify-center pt-4">
+            <button
+              onClick={() => setShowPreview(true)}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600/20 to-cyan-600/20 border border-emerald-500/30 text-emerald-400 hover:text-emerald-300 hover:border-emerald-400/50 transition-all text-sm font-medium"
+            >
+              <span className="text-lg">\u25b6</span>
+              <span>Run &amp; Test \u2014 see all {previewCount} code blocks working together</span>
+            </button>
           </div>
         )}
       </div>
