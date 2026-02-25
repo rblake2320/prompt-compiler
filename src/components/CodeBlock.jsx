@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import CodeSandbox from './CodeSandbox';
 
 // Language display names + file extensions
 const LANG_MAP = {
@@ -57,7 +58,14 @@ const LANG_MAP = {
   perl: { label: 'Perl', ext: '.pl' },
 };
 
-// Try to guess a filename from the first line (e.g. "// filename.js" or "# config.yaml")
+// Runnable in-browser or has external playground
+const RUNNABLE = new Set([
+  'html', 'javascript', 'js', 'jsx', 'css',
+  'python', 'py', 'go', 'rust', 'rs', 'java', 'cpp', 'c',
+  'ruby', 'rb', 'php', 'swift', 'kotlin', 'typescript', 'ts',
+  'sql', 'r', 'lua', 'dart', 'scala', 'perl',
+]);
+
 function guessFilename(code, language) {
   const firstLine = code.split('\n')[0]?.trim() || '';
   const match = firstLine.match(/^(?:\/\/|#|\/\*|--|;)\s*(\S+\.\w+)/);
@@ -68,6 +76,7 @@ function guessFilename(code, language) {
 
 export default function CodeBlock({ code, language }) {
   const [copied, setCopied] = useState(false);
+  const [showSandbox, setShowSandbox] = useState(false);
 
   const copy = useCallback(() => {
     navigator.clipboard.writeText(code);
@@ -88,18 +97,31 @@ export default function CodeBlock({ code, language }) {
 
   const info = LANG_MAP[language?.toLowerCase()];
   const label = info?.label || language || 'Code';
+  const canRun = RUNNABLE.has(language?.toLowerCase());
 
   return (
     <div className="my-3 rounded-lg border border-gray-700 overflow-hidden bg-gray-950">
       <div className="flex items-center justify-between px-3 py-1.5 bg-gray-900 border-b border-gray-700">
         <span className="text-xs font-medium text-gray-400">{label}</span>
         <div className="flex items-center gap-1">
+          {canRun && (
+            <button
+              onClick={() => setShowSandbox(!showSandbox)}
+              className={`text-xs px-2 py-0.5 rounded transition-all font-medium ${
+                showSandbox
+                  ? 'text-emerald-400 bg-emerald-900/30'
+                  : 'text-emerald-400/70 hover:text-emerald-400 hover:bg-emerald-900/20'
+              }`}
+            >
+              {showSandbox ? '\u25a0 Stop' : '\u25b6 Run'}
+            </button>
+          )}
           <button
             onClick={download}
             className="text-xs px-2 py-0.5 rounded transition-all font-medium text-gray-400 hover:text-gray-200 hover:bg-gray-800"
             title={`Download as ${guessFilename(code, language)}`}
           >
-            ↓ Save
+            \u2193 Save
           </button>
           <button
             onClick={copy}
@@ -109,13 +131,20 @@ export default function CodeBlock({ code, language }) {
                 : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
             }`}
           >
-            {copied ? '✓ Copied' : 'Copy'}
+            {copied ? '\u2713 Copied' : 'Copy'}
           </button>
         </div>
       </div>
       <pre className="p-3 overflow-x-auto text-sm leading-relaxed font-mono text-gray-300 selection:bg-violet-500/30">
         <code>{code}</code>
       </pre>
+      {showSandbox && (
+        <CodeSandbox
+          code={code}
+          language={language}
+          onClose={() => setShowSandbox(false)}
+        />
+      )}
     </div>
   );
 }
