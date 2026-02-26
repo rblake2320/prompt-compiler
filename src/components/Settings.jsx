@@ -3,11 +3,11 @@ import { getSettings, saveSettings, PROVIDER_CONFIGS } from '../lib/settings';
 import { callClaude } from '../lib/claude';
 import { TASK_TYPES, MEDIA_PROVIDERS, getRouterConfig, saveRouterConfig, getMediaKeys, saveMediaKeys } from '../lib/router';
 
-export default function Settings({ onClose }) {
+export default function Settings({ onClose, initialTab }) {
   const [s, setS] = useState(getSettings);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState('');
-  const [tab, setTab] = useState('general');
+  const [tab, setTab] = useState(initialTab || 'general');
   const [routes, setRoutes] = useState(getRouterConfig);
   const [mediaKeys, setMediaKeys] = useState(getMediaKeys);
 
