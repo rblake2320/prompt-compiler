@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { callClaude, streamClaudeWithHistory, agenticToolCall, robustJsonParse } from '../lib/claude';
+import { callRouted, callClaude, streamClaudeWithHistory, agenticToolCall, robustJsonParse } from '../lib/claude';
+import { calculateBudget } from '../lib/context';
 import {
   buildDecomposeSystem,
   buildSynthesizeSystem,
@@ -13,16 +14,15 @@ import {
 } from '../lib/settings';
 import { createProject, updateProject, saveVersion } from '../lib/projects';
 import { BUILT_IN_TOOLS, getAllTools } from '../lib/tools';
-import { injectAssetIntoHtml } from '../lib/assetManager';
+import { injectImageAsset, injectAudioAsset } from '../lib/assets';
 import Settings from './Settings';
 import LayerCard from './LayerCard';
 import AddLayerModal from './AddLayerModal';
 import OutputView from './OutputView';
 import ProjectManager from './ProjectManager';
 import ToolConfig from './ToolConfig';
-import ModelRouterConfig from './ModelRouterConfig';
-import AssetPanel from './AssetPanel';
-import ContextIndicator from './ContextIndicator';
+import AssetGallery from './AssetGallery';
+import TokenBudget from './TokenBudget';
 
 function loadHistory() {
   try { return JSON.parse(localStorage.getItem('pc_history') || '[]'); }
@@ -260,8 +260,13 @@ export default function PromptCompiler() {
   }, []);
 
   const handleInjectAsset = useCallback((asset) => {
-    if (!currentHtml) return;
-    const updated = injectAssetIntoHtml(currentHtml, asset);
+    if (!currentHtml || !asset?.dataUri) return;
+    let updated;
+    if (asset.type === 'audio' || asset.type === 'speech') {
+      updated = injectAudioAsset(currentHtml, asset.id, asset.dataUri);
+    } else {
+      updated = injectImageAsset(currentHtml, asset.id, asset.dataUri);
+    }
     if (updated !== currentHtml) {
       handleUpdateHtml(updated, `Injected ${asset.type}: ${asset.name}`);
     }
@@ -317,12 +322,12 @@ export default function PromptCompiler() {
     setToolActivity([]);
     try {
       setPhase(`Phase 1/2 \u2014 Decomposing into ${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'}\u2026`);
-      const rawLayers = await callClaude(buildDecomposeSystem(activeLayers), 'Task/Goal:\n' + input, 'compile');
+      const rawLayers = await callRouted(buildDecomposeSystem(activeLayers), 'Task/Goal:\n' + input, 'decompose');
       const parsed = robustJsonParse(rawLayers);
       setLayers(parsed);
       setPhase('Phase 2/2 \u2014 Synthesizing compiled prompt\u2026');
       const synthInput = 'Original task: ' + input + '\n\nLayer Decomposition:\n' + JSON.stringify(parsed, null, 2);
-      const rawSynth = await callClaude(buildSynthesizeSystem(activeLayers), synthInput, 'compile');
+      const rawSynth = await callRouted(buildSynthesizeSystem(activeLayers), synthInput, 'synthesize');
       setSynthesized(rawSynth.trim());
       addToHistory(input, parsed, rawSynth.trim(), activeLayers);
     } catch (e) { setError(e.message); }
@@ -336,7 +341,7 @@ export default function PromptCompiler() {
     setError('');
     try {
       const synthInput = 'Original task: ' + input + '\n\nLayer Decomposition:\n' + JSON.stringify(layers, null, 2);
-      const rawSynth = await callClaude(buildSynthesizeSystem(activeLayers), synthInput, 'compile');
+      const rawSynth = await callRouted(buildSynthesizeSystem(activeLayers), synthInput, 'synthesize');
       setSynthesized(rawSynth.trim());
       setLayersEdited(false);
       setActiveTab('synthesized');
@@ -650,12 +655,11 @@ export default function PromptCompiler() {
           </div>
         )}
 
-        {/* Asset Panel (toggle) */}
+        {/* Asset Gallery (toggle) */}
         {showAssets && (
-          <AssetPanel
-            assets={assets}
+          <AssetGallery
+            projectId={currentProject?.id}
             onInjectAsset={handleInjectAsset}
-            onRemoveAsset={handleRemoveAsset}
             onClose={() => setShowAssets(false)}
           />
         )}
@@ -884,12 +888,10 @@ export default function PromptCompiler() {
                 ))}
               </div>
 
-              {/* Context indicator — show when on output tab */}
+              {/* Token budget indicator — show when on output tab */}
               {activeTab === 'output' && conversation.length > 0 && (
-                <ContextIndicator
-                  systemPrompt={buildProjectSystemPrompt()}
-                  messages={conversation}
-                  compressionStats={contextStats}
+                <TokenBudget
+                  budget={contextStats}
                 />
               )}
             </div>
@@ -1029,7 +1031,7 @@ export default function PromptCompiler() {
         />
       )}
       {showModelRouter && (
-        <ModelRouterConfig onClose={() => setShowModelRouter(false)} />
+        <Settings onClose={() => setShowModelRouter(false)} initialTab="router" />
       )}
     </div>
   );
