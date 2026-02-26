@@ -1,4 +1,5 @@
 import { getSettings, PROVIDER_CONFIGS } from './settings.js';
+import { routeToolCall } from './tools.js';
 
 function getRequestConfig(provider, apiKey, config) {
   const headers = { 'Content-Type': 'application/json' };
@@ -43,6 +44,9 @@ function buildBodyWithHistory(system, messages, provider, model, opts = {}) {
     ? { model, max_tokens: 8192, system, messages }
     : { model, max_tokens: 8192, messages: [{ role: 'system', content: system }, ...messages] };
   if (opts.stream) base.stream = true;
+  if (opts.tools && opts.tools.length > 0 && provider === 'anthropic') {
+    base.tools = opts.tools;
+  }
   return base;
 }
 
@@ -93,13 +97,6 @@ export async function callClaudeWithHistory(system, messages) {
 /**
  * Streaming multi-turn conversation.
  * Calls onDelta(textChunk) as tokens arrive, returns full text when done.
- * Falls back to non-streaming if ReadableStream isn't available.
- *
- * @param {string} system - System prompt
- * @param {Array<{role: string, content: string}>} messages - Conversation
- * @param {(chunk: string) => void} onDelta - Called with each text chunk
- * @param {AbortSignal} [signal] - Optional abort signal
- * @returns {Promise<string>} Complete response text
  */
 export async function streamClaudeWithHistory(system, messages, onDelta, signal) {
   const { provider = 'anthropic', model, apiKey = '' } = getSettings();
@@ -120,7 +117,6 @@ export async function streamClaudeWithHistory(system, messages, onDelta, signal)
     throw new Error(`API ${res.status}: ${errText.slice(0, 300) || res.statusText}`);
   }
 
-  // If no streaming support, fall back
   if (!res.body) {
     const data = await res.json();
     const text = parseResponse(data, provider);
@@ -140,35 +136,28 @@ export async function streamClaudeWithHistory(system, messages, onDelta, signal)
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === 'event: ping') continue;
-
-        // Skip SSE event type lines
         if (trimmed.startsWith('event:')) continue;
-
         if (!trimmed.startsWith('data:')) continue;
         const dataStr = trimmed.slice(5).trim();
-
-        if (dataStr === '[DONE]') continue; // OpenAI end signal
+        if (dataStr === '[DONE]') continue;
 
         let parsed;
         try { parsed = JSON.parse(dataStr); } catch { continue; }
 
         let chunk = '';
         if (provider === 'anthropic') {
-          // Anthropic SSE: content_block_delta events
           if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
             chunk = parsed.delta.text;
           }
-          // Also handle message_start, content_block_start (no text), message_stop (done)
           if (parsed.type === 'error') {
             throw new Error(parsed.error?.message || 'Stream error');
           }
         } else {
-          // OpenAI-compatible (OpenAI, Groq, Gemini)
           const delta = parsed.choices?.[0]?.delta;
           if (delta?.content) {
             chunk = delta.content;
@@ -186,6 +175,107 @@ export async function streamClaudeWithHistory(system, messages, onDelta, signal)
   }
 
   return fullText;
+}
+
+/**
+ * Agentic tool-use conversation.
+ * Non-streaming. Runs a loop: send → check for tool_use → execute → send result → repeat.
+ * 
+ * @param {string} system - System prompt
+ * @param {Array} messages - Conversation history
+ * @param {Array} tools - Tool definitions (Claude API format)
+ * @param {object} toolContext - Context passed to tool executors
+ * @param {object} opts - { maxTurns, signal, onToolUse, onText }
+ * @returns {Promise<{ text: string, toolResults: Array }>}
+ */
+export async function agenticToolCall(
+  system,
+  messages,
+  tools,
+  toolContext = {},
+  opts = {}
+) {
+  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
+  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
+  const resolvedModel = model || config.defaultModel;
+  const { url, headers } = getRequestConfig(provider, apiKey, config);
+
+  const maxTurns = opts.maxTurns || 5;
+  const allToolResults = [];
+  let conversationMessages = [...messages];
+  let finalText = '';
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    if (opts.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    const body = buildBodyWithHistory(
+      system,
+      conversationMessages,
+      provider,
+      resolvedModel,
+      { tools }
+    );
+
+    const data = await doFetch(url, headers, body);
+
+    // Extract text and tool_use blocks from response
+    const textBlocks = [];
+    const toolUseBlocks = [];
+
+    for (const block of data.content || []) {
+      if (block.type === 'text') {
+        textBlocks.push(block.text);
+      } else if (block.type === 'tool_use') {
+        toolUseBlocks.push(block);
+      }
+    }
+
+    const responseText = textBlocks.join('');
+    if (responseText) {
+      finalText += responseText;
+      if (opts.onText) opts.onText(responseText);
+    }
+
+    // If no tool calls, we're done
+    if (toolUseBlocks.length === 0 || data.stop_reason !== 'tool_use') {
+      break;
+    }
+
+    // Add assistant response to conversation
+    conversationMessages.push({ role: 'assistant', content: data.content });
+
+    // Execute each tool and collect results
+    const toolResultContent = [];
+    for (const toolUse of toolUseBlocks) {
+      if (opts.onToolUse) {
+        opts.onToolUse(toolUse.name, toolUse.input);
+      }
+
+      const { result, sideEffects } = await routeToolCall(
+        toolUse.name,
+        toolUse.input,
+        toolContext
+      );
+
+      allToolResults.push({
+        tool: toolUse.name,
+        input: toolUse.input,
+        result,
+        sideEffects,
+      });
+
+      toolResultContent.push({
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: result,
+      });
+    }
+
+    // Send tool results back
+    conversationMessages.push({ role: 'user', content: toolResultContent });
+  }
+
+  return { text: finalText, toolResults: allToolResults };
 }
 
 export function robustJsonParse(raw) {
