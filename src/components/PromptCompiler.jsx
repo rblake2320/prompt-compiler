@@ -1,6 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { callRouted, callClaude, streamClaudeWithHistory, agenticToolCall, robustJsonParse } from '../lib/claude';
-import { calculateBudget } from '../lib/context';
+import { callRouted, streamClaudeWithHistory, robustJsonParse } from '../lib/claude';
 import {
   buildDecomposeSystem,
   buildSynthesizeSystem,
@@ -13,7 +12,7 @@ import {
   saveCustomLayers,
 } from '../lib/settings';
 import { createProject, updateProject, saveVersion } from '../lib/projects';
-import { BUILT_IN_TOOLS, getAllTools } from '../lib/tools';
+import { BUILT_IN_TOOLS } from '../lib/tools';
 import { injectImageAsset, injectAudioAsset } from '../lib/assets';
 import Settings from './Settings';
 import LayerCard from './LayerCard';
