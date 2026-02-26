@@ -1,5 +1,13 @@
+/**
+ * Claude / Multi-Provider API Client — v2 with context management + model routing.
+ */
+
 import { getSettings, PROVIDER_CONFIGS } from './settings.js';
 import { routeToolCall } from './tools.js';
+import { manageContext } from './contextManager.js';
+import { getModelForTask, getApiKeyForProvider, detectTaskType } from './modelRouter.js';
+
+// ─── Request Configuration ────────────────────────────────────────
 
 function getRequestConfig(provider, apiKey, config) {
   const headers = { 'Content-Type': 'application/json' };
@@ -25,6 +33,27 @@ function getRequestConfig(provider, apiKey, config) {
   return { url, headers };
 }
 
+/**
+ * Resolve provider, model, apiKey, and config for a given task type.
+ * Falls back to global settings if no router config exists.
+ */
+function resolveModelConfig(taskType) {
+  if (taskType) {
+    const route = getModelForTask(taskType);
+    const provider = route.provider || 'anthropic';
+    const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
+    const model = route.model || config.defaultModel;
+    const apiKey = getApiKeyForProvider(provider);
+    return { provider, model, apiKey, config };
+  }
+  // Fallback to global settings
+  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
+  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
+  return { provider, model: model || config.defaultModel, apiKey, config };
+}
+
+// ─── Body Builders ────────────────────────────────────────────────
+
 function buildBody(system, userMessage, provider, model) {
   if (provider === 'anthropic') {
     return { model, max_tokens: 4000, system, messages: [{ role: 'user', content: userMessage }] };
@@ -40,9 +69,10 @@ function buildBody(system, userMessage, provider, model) {
 }
 
 function buildBodyWithHistory(system, messages, provider, model, opts = {}) {
+  const maxTokens = opts.maxTokens || 8192;
   const base = provider === 'anthropic'
-    ? { model, max_tokens: 8192, system, messages }
-    : { model, max_tokens: 8192, messages: [{ role: 'system', content: system }, ...messages] };
+    ? { model, max_tokens: maxTokens, system, messages }
+    : { model, max_tokens: maxTokens, messages: [{ role: 'system', content: system }, ...messages] };
   if (opts.stream) base.stream = true;
   if (opts.tools && opts.tools.length > 0 && provider === 'anthropic') {
     base.tools = opts.tools;
@@ -72,38 +102,74 @@ async function doFetch(url, headers, body) {
   return data;
 }
 
-// Non-streaming single call (for decompose/synthesize phases)
-export async function callClaude(system, userMessage) {
-  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
-  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
-  const resolvedModel = model || config.defaultModel;
-  const { url, headers } = getRequestConfig(provider, apiKey, config);
-  const body = buildBody(system, userMessage, provider, resolvedModel);
-  const data = await doFetch(url, headers, body);
-  return parseResponse(data, provider);
-}
-
-// Non-streaming multi-turn (fallback)
-export async function callClaudeWithHistory(system, messages) {
-  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
-  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
-  const resolvedModel = model || config.defaultModel;
-  const { url, headers } = getRequestConfig(provider, apiKey, config);
-  const body = buildBodyWithHistory(system, messages, provider, resolvedModel);
-  const data = await doFetch(url, headers, body);
-  return parseResponse(data, provider);
-}
+// ─── Smart max_tokens ─────────────────────────────────────────────
 
 /**
- * Streaming multi-turn conversation.
- * Calls onDelta(textChunk) as tokens arrive, returns full text when done.
+ * Determine appropriate max_tokens based on task type and context.
  */
-export async function streamClaudeWithHistory(system, messages, onDelta, signal) {
-  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
-  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
-  const resolvedModel = model || config.defaultModel;
+function getSmartMaxTokens(taskType, messageLength) {
+  const defaults = {
+    compile: 4000,
+    code: 16384,       // Code gen needs room
+    chat: 2048,        // Quick responses
+    review: 4096,      // Analysis
+    summarize: 2048,   // Compression
+  };
+  return defaults[taskType] || 8192;
+}
+
+// ─── Non-streaming single call ────────────────────────────────────
+
+/**
+ * Single-turn call with optional task-based routing.
+ */
+export async function callClaude(system, userMessage, taskType) {
+  const { provider, model, apiKey, config } = resolveModelConfig(taskType || 'compile');
   const { url, headers } = getRequestConfig(provider, apiKey, config);
-  const body = buildBodyWithHistory(system, messages, provider, resolvedModel, { stream: true });
+  const body = buildBody(system, userMessage, provider, model);
+  const data = await doFetch(url, headers, body);
+  return parseResponse(data, provider);
+}
+
+// ─── Non-streaming multi-turn ─────────────────────────────────────
+
+export async function callClaudeWithHistory(system, messages, taskType) {
+  const { provider, model, apiKey, config } = resolveModelConfig(taskType);
+  const { url, headers } = getRequestConfig(provider, apiKey, config);
+  const body = buildBodyWithHistory(system, messages, provider, model);
+  const data = await doFetch(url, headers, body);
+  return parseResponse(data, provider);
+}
+
+// ─── Streaming multi-turn with context management ─────────────────
+
+/**
+ * Streaming multi-turn conversation with automatic context compression.
+ * 
+ * @param {string} system - System prompt
+ * @param {Array} messages - Full conversation history (will be auto-compressed)
+ * @param {Function} onDelta - Called with each text chunk
+ * @param {AbortSignal} signal
+ * @param {object} opts - { taskType, maxContextTokens }
+ * @returns {{ fullText: string, contextStats: object }}
+ */
+export async function streamClaudeWithHistory(system, messages, onDelta, signal, opts = {}) {
+  const taskType = opts.taskType || detectTaskType(messages[messages.length - 1]?.content || '');
+  const { provider, model, apiKey, config } = resolveModelConfig(taskType);
+  const { url, headers } = getRequestConfig(provider, apiKey, config);
+
+  // Apply context management — compress if needed
+  const { messages: managedMessages, stats } = manageContext(system, messages, {
+    maxContextTokens: opts.maxContextTokens || 150000,
+    keepRecentFull: 3,
+    deduplicateHtml: true,
+  });
+
+  const maxTokens = getSmartMaxTokens(taskType, managedMessages.length);
+  const body = buildBodyWithHistory(system, managedMessages, provider, model, { 
+    stream: true, 
+    maxTokens 
+  });
 
   const res = await fetch(url, {
     method: 'POST',
@@ -121,7 +187,7 @@ export async function streamClaudeWithHistory(system, messages, onDelta, signal)
     const data = await res.json();
     const text = parseResponse(data, provider);
     onDelta(text);
-    return text;
+    return { fullText: text, contextStats: stats };
   }
 
   const reader = res.body.getReader();
@@ -174,19 +240,14 @@ export async function streamClaudeWithHistory(system, messages, onDelta, signal)
     reader.releaseLock();
   }
 
-  return fullText;
+  return { fullText, contextStats: stats };
 }
 
+// ─── Agentic tool-use conversation ────────────────────────────────
+
 /**
- * Agentic tool-use conversation.
+ * Agentic tool-use conversation with context management.
  * Non-streaming. Runs a loop: send → check for tool_use → execute → send result → repeat.
- * 
- * @param {string} system - System prompt
- * @param {Array} messages - Conversation history
- * @param {Array} tools - Tool definitions (Claude API format)
- * @param {object} toolContext - Context passed to tool executors
- * @param {object} opts - { maxTurns, signal, onToolUse, onText }
- * @returns {Promise<{ text: string, toolResults: Array }>}
  */
 export async function agenticToolCall(
   system,
@@ -195,14 +256,20 @@ export async function agenticToolCall(
   toolContext = {},
   opts = {}
 ) {
-  const { provider = 'anthropic', model, apiKey = '' } = getSettings();
-  const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
-  const resolvedModel = model || config.defaultModel;
+  const taskType = opts.taskType || 'code';
+  const { provider, model, apiKey, config } = resolveModelConfig(taskType);
   const { url, headers } = getRequestConfig(provider, apiKey, config);
 
+  // Apply context management
+  const { messages: managedMessages, stats } = manageContext(system, messages, {
+    maxContextTokens: opts.maxContextTokens || 150000,
+    keepRecentFull: 3,
+  });
+
   const maxTurns = opts.maxTurns || 5;
+  const maxTokens = getSmartMaxTokens(taskType, managedMessages.length);
   const allToolResults = [];
-  let conversationMessages = [...messages];
+  let conversationMessages = [...managedMessages];
   let finalText = '';
 
   for (let turn = 0; turn < maxTurns; turn++) {
@@ -212,13 +279,12 @@ export async function agenticToolCall(
       system,
       conversationMessages,
       provider,
-      resolvedModel,
-      { tools }
+      model,
+      { tools, maxTokens }
     );
 
     const data = await doFetch(url, headers, body);
 
-    // Extract text and tool_use blocks from response
     const textBlocks = [];
     const toolUseBlocks = [];
 
@@ -236,15 +302,12 @@ export async function agenticToolCall(
       if (opts.onText) opts.onText(responseText);
     }
 
-    // If no tool calls, we're done
     if (toolUseBlocks.length === 0 || data.stop_reason !== 'tool_use') {
       break;
     }
 
-    // Add assistant response to conversation
     conversationMessages.push({ role: 'assistant', content: data.content });
 
-    // Execute each tool and collect results
     const toolResultContent = [];
     for (const toolUse of toolUseBlocks) {
       if (opts.onToolUse) {
@@ -271,12 +334,13 @@ export async function agenticToolCall(
       });
     }
 
-    // Send tool results back
     conversationMessages.push({ role: 'user', content: toolResultContent });
   }
 
-  return { text: finalText, toolResults: allToolResults };
+  return { text: finalText, toolResults: allToolResults, contextStats: stats };
 }
+
+// ─── Utilities ────────────────────────────────────────────────────
 
 export function robustJsonParse(raw) {
   let s = raw.trim().replace(/```(?:json)?\s*\n?/m, '').replace(/\n?```\s*$/m, '').trim();
