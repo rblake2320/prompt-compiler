@@ -2,6 +2,7 @@ import { getSettings, PROVIDER_CONFIGS } from './settings.js';
 import { routeToolCall } from './tools.js';
 import { resolveRoute } from './router.js';
 import { applySlidingWindow, getSmartMaxTokens, calculateBudget } from './context.js';
+import { resilientCall, classifyError, friendlyError, buildFallbackChain, ERROR_TYPES } from './resilience.js';
 
 function getRequestConfig(provider, apiKey, config) {
   const headers = { 'Content-Type': 'application/json' };
@@ -61,18 +62,34 @@ async function doFetch(url, headers, body) {
 }
 
 export async function callRouted(system, userMessage, taskType = 'decompose', opts = {}) {
-  const mainSettings = getSettings();
-  const route = resolveRoute(taskType, mainSettings);
-  const config = PROVIDER_CONFIGS[route.provider] || PROVIDER_CONFIGS.anthropic;
-  const maxTokens = getSmartMaxTokens(taskType, route.model);
-  const { url, headers } = getRequestConfig(route.provider, route.apiKey, config);
-  const body = buildBody(system, userMessage, route.provider, route.model, maxTokens);
+  // Inner function parameterized for resilience wrapper
+  const makeCall = async (provider, model, apiKey) => {
+    const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
+    const maxTokens = getSmartMaxTokens(taskType, model);
+    const { url, headers } = getRequestConfig(provider, apiKey, config);
+    const body = buildBody(system, userMessage, provider, model, maxTokens);
+    const data = await doFetch(url, headers, body);
+    return parseResponse(data, provider);
+  };
+
   if (opts.onBudget) {
-    const budget = calculateBudget(system, [{ role: 'user', content: userMessage }], route.model, maxTokens);
+    const mainSettings = getSettings();
+    const route = resolveRoute(taskType, mainSettings);
+    const budget = calculateBudget(system, [{ role: 'user', content: userMessage }], route.model, getSmartMaxTokens(taskType, route.model));
     opts.onBudget(budget);
   }
-  const data = await doFetch(url, headers, body);
-  return parseResponse(data, route.provider);
+
+  const { result, provider, model, wasFallback } = await resilientCall(makeCall, taskType, {
+    onStatus: opts.onStatus,
+    signal: opts.signal,
+    maxRetries: opts.maxRetries ?? 2,
+  });
+
+  if (wasFallback && opts.onFallback) {
+    opts.onFallback(provider, model);
+  }
+
+  return result;
 }
 
 export async function callClaude(system, userMessage) {
@@ -98,68 +115,109 @@ export async function callClaudeWithHistory(system, messages) {
 export async function streamClaudeWithHistory(system, messages, onDelta, signal, opts = {}) {
   const mainSettings = getSettings();
   const taskType = opts.taskType || 'followup';
-  const route = resolveRoute(taskType, mainSettings);
-  const config = PROVIDER_CONFIGS[route.provider] || PROVIDER_CONFIGS[mainSettings.provider] || PROVIDER_CONFIGS.anthropic;
-  const resolvedModel = route.model || mainSettings.model || config.defaultModel;
-  const maxTokens = opts.maxTokens || getSmartMaxTokens(taskType, resolvedModel);
-  const { url, headers } = getRequestConfig(route.provider, route.apiKey || mainSettings.apiKey, config);
 
   const { messages: windowedMessages, wasTruncated } = applySlidingWindow(messages, {
     keepRecent: opts.keepRecent || 4, maxTokens: opts.contextBudget || 80000,
   });
   if (wasTruncated && opts.onTruncated) opts.onTruncated();
-  if (opts.onBudget) {
-    const budget = calculateBudget(system, windowedMessages, resolvedModel, maxTokens);
-    opts.onBudget(budget);
-  }
 
-  const body = buildBodyWithHistory(system, windowedMessages, route.provider, resolvedModel, { stream: true, maxTokens });
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`API ${res.status}: ${errText.slice(0, 300) || res.statusText}`);
-  }
-  if (!res.body) {
-    const data = await res.json();
-    const text = parseResponse(data, route.provider);
-    onDelta(text);
-    return text;
-  }
+  // Inner stream function parameterized for fallback
+  const doStream = async (provider, model, apiKey) => {
+    const config = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.anthropic;
+    const maxTokens = opts.maxTokens || getSmartMaxTokens(taskType, model);
+    const { url, headers } = getRequestConfig(provider, apiKey, config);
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let fullText = '';
-  let buffer = '';
+    if (opts.onBudget) {
+      const budget = calculateBudget(system, windowedMessages, model, maxTokens);
+      opts.onBudget(budget);
+    }
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === 'event: ping') continue;
-        if (trimmed.startsWith('event:')) continue;
-        if (!trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === '[DONE]') continue;
-        let parsed;
-        try { parsed = JSON.parse(dataStr); } catch { continue; }
-        let chunk = '';
-        if (route.provider === 'anthropic') {
-          if (parsed.type === 'content_block_delta' && parsed.delta?.text) chunk = parsed.delta.text;
-          if (parsed.type === 'error') throw new Error(parsed.error?.message || 'Stream error');
-        } else {
-          const delta = parsed.choices?.[0]?.delta;
-          if (delta?.content) chunk = delta.content;
+    const body = buildBodyWithHistory(system, windowedMessages, provider, model, { stream: true, maxTokens });
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`API ${res.status}: ${errText.slice(0, 300) || res.statusText}`);
+    }
+    if (!res.body) {
+      const data = await res.json();
+      const text = parseResponse(data, provider);
+      onDelta(text);
+      return { fullText: text, provider, model };
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === 'event: ping') continue;
+          if (trimmed.startsWith('event:')) continue;
+          if (!trimmed.startsWith('data:')) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === '[DONE]') continue;
+          let parsed;
+          try { parsed = JSON.parse(dataStr); } catch { continue; }
+          let chunk = '';
+          if (provider === 'anthropic') {
+            if (parsed.type === 'content_block_delta' && parsed.delta?.text) chunk = parsed.delta.text;
+            if (parsed.type === 'error') throw new Error(parsed.error?.message || 'Stream error');
+          } else {
+            const delta = parsed.choices?.[0]?.delta;
+            if (delta?.content) chunk = delta.content;
+          }
+          if (chunk) { fullText += chunk; onDelta(chunk); }
         }
-        if (chunk) { fullText += chunk; onDelta(chunk); }
+      }
+    } finally { reader.releaseLock(); }
+    return { fullText, provider, model };
+  };
+
+  // Try primary, then fallback chain
+  try {
+    const route = resolveRoute(taskType, mainSettings);
+    const primaryResult = await doStream(route.provider, route.model, route.apiKey || mainSettings.apiKey);
+    const contextStats = opts._contextStats || null;
+    return { fullText: primaryResult.fullText, contextStats, provider: primaryResult.provider, model: primaryResult.model, wasFallback: false };
+  } catch (primaryError) {
+    if (primaryError.name === 'AbortError') throw primaryError;
+
+    const classification = classifyError(primaryError);
+    if (!classification.fallbackable) throw primaryError;
+
+    // Attempt fallback
+    const route = resolveRoute(taskType, mainSettings);
+    if (opts.onStatus) opts.onStatus(friendlyError(classification, route.provider, route.model), 'warn');
+
+    const chain = buildFallbackChain(taskType, route.provider, route.model, classification.type);
+
+    for (const fallback of chain) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const fbName = `${PROVIDER_CONFIGS[fallback.provider]?.name || fallback.provider} / ${fallback.model}`;
+      if (opts.onStatus) opts.onStatus(`Trying fallback: ${fbName}…`, 'info');
+
+      try {
+        const fbResult = await doStream(fallback.provider, fallback.model, fallback.apiKey);
+        if (opts.onStatus) opts.onStatus(`Fallback succeeded: ${fbName}`, 'success');
+        if (opts.onFallback) opts.onFallback(fallback.provider, fallback.model);
+        return { fullText: fbResult.fullText, contextStats: null, provider: fbResult.provider, model: fbResult.model, wasFallback: true };
+      } catch (fbError) {
+        if (fbError.name === 'AbortError') throw fbError;
+        if (opts.onStatus) opts.onStatus(`Fallback ${fbName} failed`, 'warn');
       }
     }
-  } finally { reader.releaseLock(); }
-  return fullText;
+
+    // All fallbacks exhausted
+    throw primaryError;
+  }
 }
 
 export async function agenticToolCall(system, messages, tools, toolContext = {}, opts = {}) {
