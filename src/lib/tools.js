@@ -1,15 +1,19 @@
 /**
- * Tool system for Prompt Compiler.
+ * Tool system for Prompt Compiler — v2 with media generation.
  * 
  * Architecture:
- * 1. Built-in tools - shipped with the app (update_html, validate, etc.)
+ * 1. Built-in tools - shipped with the app (update_html, validate, generate_image, etc.)
  * 2. User tools - custom JSON schemas pasted by user
- * 3. MCP tools - fetched from MCP server endpoints (future)
+ * 3. MCP tools - fetched from MCP server endpoints
  * 
  * Tools are injected into Claude API calls via the `tools` parameter.
  * When Claude responds with tool_use, the app executes the tool and
  * sends tool_result back in an agentic loop.
  */
+
+import { generateImage, generateSpeech, imageToDataUri, audioToDataUri } from './mediaProviders.js';
+import { createAsset } from './assetManager.js';
+import { getModelForTask } from './modelRouter.js';
 
 // ─── Built-in Tool Definitions ────────────────────────────────────
 
@@ -60,6 +64,70 @@ export const BUILT_IN_TOOLS = [
       required: ['issues'],
     },
   },
+  {
+    name: 'generate_image',
+    description:
+      'Generate an AI image using DALL-E or Stability AI. Use this when the user asks for ' +
+      'images, illustrations, icons, logos, hero images, product photos, or any visual content. ' +
+      'The generated image will be added to the project assets and can be injected into the HTML.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'Detailed image generation prompt. Be specific about style, composition, colors, mood.',
+        },
+        name: {
+          type: 'string',
+          description: 'Short name for the image (used as alt text and asset reference), e.g. "hero-background"',
+        },
+        size: {
+          type: 'string',
+          enum: ['1024x1024', '1792x1024', '1024x1792'],
+          description: 'Image dimensions. 1024x1024 for square, 1792x1024 for landscape, 1024x1792 for portrait.',
+        },
+        style: {
+          type: 'string',
+          enum: ['natural', 'vivid'],
+          description: 'natural for realistic, vivid for hyper-real/dramatic',
+        },
+        inject_into_html: {
+          type: 'boolean',
+          description: 'If true, automatically replace a placeholder image in the project HTML',
+        },
+      },
+      required: ['prompt', 'name'],
+    },
+  },
+  {
+    name: 'generate_speech',
+    description:
+      'Generate text-to-speech audio using OpenAI TTS or ElevenLabs. Use this when the user ' +
+      'asks for voiceovers, narration, audio versions of text, or speech synthesis.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'The text to convert to speech',
+        },
+        name: {
+          type: 'string',
+          description: 'Short name for the audio file, e.g. "welcome-narration"',
+        },
+        voice: {
+          type: 'string',
+          enum: ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'],
+          description: 'Voice to use (OpenAI voices). nova=warm female, onyx=deep male, alloy=neutral',
+        },
+        inject_into_html: {
+          type: 'boolean',
+          description: 'If true, add an audio player element to the project HTML',
+        },
+      },
+      required: ['text', 'name'],
+    },
+  },
 ];
 
 // ─── Tool Execution ───────────────────────────────────────────────
@@ -68,10 +136,10 @@ export const BUILT_IN_TOOLS = [
  * Execute a built-in tool and return the result.
  * @param {string} toolName
  * @param {object} toolInput
- * @param {object} context - { currentHtml, onUpdateHtml, onReportIssues }
- * @returns {{ result: string, sideEffects: object }}
+ * @param {object} context - { currentHtml, onUpdateHtml, onReportIssues, onAssetCreated }
+ * @returns {Promise<{ result: string, sideEffects: object }>}
  */
-export function executeBuiltInTool(toolName, toolInput, context) {
+export async function executeBuiltInTool(toolName, toolInput, context) {
   switch (toolName) {
     case 'update_project_html': {
       const { html, changelog } = toolInput;
@@ -94,6 +162,106 @@ export function executeBuiltInTool(toolName, toolInput, context) {
         result: `Reported ${issues.length} issue(s):\n${summary}`,
         sideEffects: { type: 'issues', issues },
       };
+    }
+
+    case 'generate_image': {
+      try {
+        const route = getModelForTask('image');
+        const imageResult = await generateImage(toolInput.prompt, {
+          provider: route.provider,
+          model: route.model,
+          size: toolInput.size || '1024x1024',
+          style: toolInput.style || 'natural',
+          returnBase64: true,
+        });
+
+        const dataUri = imageToDataUri(imageResult);
+        const asset = createAsset({
+          type: 'image',
+          name: toolInput.name,
+          prompt: toolInput.prompt,
+          provider: imageResult.provider,
+          dataUri,
+          mimeType: 'image/png',
+          metadata: { revised_prompt: imageResult.revised_prompt, size: toolInput.size },
+        });
+
+        if (context.onAssetCreated) {
+          context.onAssetCreated(asset);
+        }
+
+        // Auto-inject into HTML if requested
+        if (toolInput.inject_into_html && context.currentHtml && context.onUpdateHtml) {
+          const { injectAssetIntoHtml } = await import('./assetManager.js');
+          const updatedHtml = injectAssetIntoHtml(context.currentHtml, asset);
+          if (updatedHtml !== context.currentHtml) {
+            context.onUpdateHtml(updatedHtml, `Injected image: ${toolInput.name}`);
+          }
+        }
+
+        return {
+          result: `Image "${toolInput.name}" generated successfully using ${imageResult.provider}. ` +
+            `${imageResult.revised_prompt ? `Revised prompt: ${imageResult.revised_prompt}. ` : ''}` +
+            `The image has been added to project assets.` +
+            `${toolInput.inject_into_html ? ' It was also injected into the project HTML.' : ' Use inject_into_html:true to add it to the HTML automatically.'}`,
+          sideEffects: { type: 'image_generated', asset },
+        };
+      } catch (e) {
+        return {
+          result: `Failed to generate image: ${e.message}`,
+          sideEffects: { type: 'error', error: e.message },
+        };
+      }
+    }
+
+    case 'generate_speech': {
+      try {
+        const route = getModelForTask('tts');
+        const speechResult = await generateSpeech(toolInput.text, {
+          provider: route.provider,
+          model: route.model,
+          voice: toolInput.voice || 'nova',
+        });
+
+        const dataUri = await audioToDataUri(speechResult);
+        const asset = createAsset({
+          type: 'audio',
+          name: toolInput.name,
+          prompt: toolInput.text.slice(0, 200),
+          provider: speechResult.provider,
+          dataUri,
+          mimeType: 'audio/mpeg',
+          metadata: { voice: toolInput.voice },
+        });
+
+        if (context.onAssetCreated) {
+          context.onAssetCreated(asset);
+        }
+
+        // Auto-inject audio player
+        if (toolInput.inject_into_html && context.currentHtml && context.onUpdateHtml) {
+          const { assetToHtml } = await import('./assetManager.js');
+          const audioTag = assetToHtml(asset);
+          // Add before </body>
+          const updatedHtml = context.currentHtml.replace(
+            '</body>',
+            `\n  <!-- Generated audio: ${toolInput.name} -->\n  <div style="position:fixed;bottom:16px;right:16px;z-index:1000;background:rgba(0,0,0,0.8);padding:12px;border-radius:12px;">\n    <p style="color:white;font-size:12px;margin-bottom:8px;">${toolInput.name}</p>\n    ${audioTag}\n  </div>\n</body>`
+          );
+          context.onUpdateHtml(updatedHtml, `Added audio player: ${toolInput.name}`);
+        }
+
+        return {
+          result: `Speech "${toolInput.name}" generated successfully using ${speechResult.provider}. ` +
+            `Audio has been added to project assets.` +
+            `${toolInput.inject_into_html ? ' An audio player was added to the HTML.' : ''}`,
+          sideEffects: { type: 'speech_generated', asset },
+        };
+      } catch (e) {
+        return {
+          result: `Failed to generate speech: ${e.message}`,
+          sideEffects: { type: 'error', error: e.message },
+        };
+      }
     }
 
     default:
@@ -122,7 +290,6 @@ export function saveUserTools(tools) {
 
 export function addUserTool(tool) {
   const tools = getUserTools();
-  // Validate schema
   if (!tool.name || !tool.input_schema) {
     throw new Error('Tool must have name and input_schema');
   }
@@ -141,13 +308,7 @@ export function removeUserTool(name) {
   return tools;
 }
 
-/**
- * Execute a user-defined tool.
- * User tools can specify an endpoint URL for remote execution,
- * or they return a no-op result (the AI's output IS the result).
- */
 export async function executeUserTool(toolName, toolInput, toolDef) {
-  // If tool has an endpoint, call it
   if (toolDef._endpoint) {
     try {
       const res = await fetch(toolDef._endpoint, {
@@ -161,8 +322,6 @@ export async function executeUserTool(toolName, toolInput, toolDef) {
       return { result: `Tool endpoint error: ${e.message}`, sideEffects: null };
     }
   }
-
-  // No endpoint — return the input as the result (AI structured output)
   return {
     result: JSON.stringify(toolInput),
     sideEffects: { type: 'user_tool', name: toolName, output: toolInput },
@@ -173,10 +332,6 @@ export async function executeUserTool(toolName, toolInput, toolDef) {
 
 const MCP_SERVERS_KEY = 'pc_mcp_servers';
 
-/**
- * MCP server config:
- * { name: string, url: string, transport: 'sse'|'http', enabled: boolean }
- */
 export function getMcpServers() {
   try {
     return JSON.parse(localStorage.getItem(MCP_SERVERS_KEY) || '[]');
@@ -189,10 +344,6 @@ export function saveMcpServers(servers) {
   localStorage.setItem(MCP_SERVERS_KEY, JSON.stringify(servers));
 }
 
-/**
- * Fetch available tools from an MCP server (SSE transport).
- * POST to /tools/list endpoint.
- */
 export async function fetchMcpTools(serverUrl) {
   try {
     const res = await fetch(serverUrl.replace(/\/sse$/, '') + '/tools/list', {
@@ -212,9 +363,6 @@ export async function fetchMcpTools(serverUrl) {
   }
 }
 
-/**
- * Execute a tool on an MCP server.
- */
 export async function executeMcpTool(serverUrl, toolName, toolInput) {
   try {
     const res = await fetch(serverUrl.replace(/\/sse$/, '') + '/tools/call', {
@@ -234,17 +382,22 @@ export async function executeMcpTool(serverUrl, toolName, toolInput) {
 
 /**
  * Get all available tools (built-in + user + MCP).
- * Returns array in Claude API tool format.
+ * @param {object} options
+ * @param {boolean} options.projectMode - include built-in tools
+ * @param {boolean} options.includeMedia - include media generation tools (default: true if projectMode)
+ * @returns {Array}
  */
 export function getAllTools(options = {}) {
   const tools = [];
 
-  // Built-in tools (always available when in project mode)
   if (options.projectMode) {
-    tools.push(...BUILT_IN_TOOLS);
+    if (options.includeMedia === false) {
+      tools.push(...BUILT_IN_TOOLS.filter(t => !['generate_image', 'generate_speech'].includes(t.name)));
+    } else {
+      tools.push(...BUILT_IN_TOOLS);
+    }
   }
 
-  // User-defined tools
   const userTools = getUserTools();
   tools.push(...userTools);
 
@@ -253,7 +406,6 @@ export function getAllTools(options = {}) {
 
 /**
  * Route a tool call to the right executor.
- * @returns {Promise<{ result: string, sideEffects: object|null }>}
  */
 export async function routeToolCall(toolName, toolInput, context) {
   // Check built-in first
@@ -273,7 +425,6 @@ export async function routeToolCall(toolName, toolInput, context) {
   const mcpServers = getMcpServers();
   for (const server of mcpServers) {
     if (!server.enabled) continue;
-    // We'd need cached tool lists here — for now, try calling
     try {
       return await executeMcpTool(server.url, toolName, toolInput);
     } catch {
