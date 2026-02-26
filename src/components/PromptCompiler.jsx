@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { callClaude, streamClaudeWithHistory, robustJsonParse } from '../lib/claude';
+import { callClaude, streamClaudeWithHistory, agenticToolCall, robustJsonParse } from '../lib/claude';
 import {
   buildDecomposeSystem,
   buildSynthesizeSystem,
@@ -11,10 +11,14 @@ import {
   getCustomLayers,
   saveCustomLayers,
 } from '../lib/settings';
+import { createProject, updateProject, saveVersion } from '../lib/projects';
+import { BUILT_IN_TOOLS, getAllTools } from '../lib/tools';
 import Settings from './Settings';
 import LayerCard from './LayerCard';
 import AddLayerModal from './AddLayerModal';
 import OutputView from './OutputView';
+import ProjectManager from './ProjectManager';
+import ToolConfig from './ToolConfig';
 
 function loadHistory() {
   try { return JSON.parse(localStorage.getItem('pc_history') || '[]'); }
@@ -45,6 +49,14 @@ export default function PromptCompiler() {
   const [runLoading, setRunLoading] = useState(false);
   const abortRef = useRef(null);
 
+  // Project state
+  const [currentProject, setCurrentProject] = useState(null);
+  const [currentHtml, setCurrentHtml] = useState('');
+  const [showProjects, setShowProjects] = useState(false);
+  const [showTools, setShowTools] = useState(false);
+  const [projectNotice, setProjectNotice] = useState('');
+  const [changeLog, setChangeLog] = useState([]);
+
   // Layer config
   const [customLayers, setCustomLayers] = useState(getCustomLayers);
   const [selectedKeys, setSelectedKeys] = useState(() => {
@@ -60,7 +72,6 @@ export default function PromptCompiler() {
 
   useEffect(() => { setHistory(loadHistory()); }, []);
 
-  // Cleanup abort controller on unmount
   useEffect(() => {
     return () => { if (abortRef.current) abortRef.current.abort(); };
   }, []);
@@ -186,6 +197,67 @@ export default function PromptCompiler() {
     }
   }, []);
 
+  // Project helpers
+  const saveCurrentAsProject = useCallback(async (convo, html) => {
+    try {
+      if (currentProject) {
+        const updated = await updateProject(currentProject.id, {
+          conversation: convo,
+          currentHtml: html || currentHtml,
+          compiledPrompt: synthesized,
+        });
+        setCurrentProject(updated);
+        setProjectNotice('Project saved');
+      } else {
+        const project = await createProject({
+          name: input.slice(0, 60),
+          input,
+          compiledPrompt: synthesized,
+          layers,
+          layerKeys: activeLayers.map(l => l.key),
+          currentHtml: html || currentHtml,
+          conversation: convo,
+        });
+        setCurrentProject(project);
+        setProjectNotice('Project created');
+      }
+      setTimeout(() => setProjectNotice(''), 2000);
+    } catch (e) {
+      console.error('Failed to save project', e);
+    }
+  }, [currentProject, currentHtml, synthesized, input, layers, activeLayers]);
+
+  const handleUpdateHtml = useCallback((html, changelog) => {
+    setCurrentHtml(html);
+    setChangeLog(prev => [...prev, { time: new Date().toISOString(), text: changelog }]);
+  }, []);
+
+  const loadProject = useCallback((project) => {
+    setInput(project.input || '');
+    setLayers(project.layers || null);
+    setSynthesized(project.compiledPrompt || '');
+    setConversation(project.conversation || []);
+    setCurrentHtml(project.currentHtml || '');
+    setCurrentProject(project);
+    setActiveTab(project.conversation?.length > 0 ? 'output' : project.compiledPrompt ? 'synthesized' : 'layers');
+    setShowProjects(false);
+    setLayersEdited(false);
+    if (project.layerKeys) {
+      setSelectedKeys(project.layerKeys);
+      saveActiveLayers(project.layerKeys);
+    }
+  }, []);
+
+  const handleSaveVersion = useCallback(async () => {
+    if (!currentProject) return;
+    const label = window.prompt('Version label:', `v${(currentProject.versions?.length || 0) + 1}`);
+    if (!label) return;
+    const updated = await saveVersion(currentProject.id, label);
+    setCurrentProject(updated);
+    setProjectNotice('Version saved');
+    setTimeout(() => setProjectNotice(''), 2000);
+  }, [currentProject]);
+
   // Compile
   const compile = useCallback(async () => {
     if (!input.trim() || activeLayers.length === 0) return;
@@ -198,6 +270,8 @@ export default function PromptCompiler() {
     setLayersEdited(false);
     setConversation([]);
     setStreamingText('');
+    setCurrentHtml('');
+    setChangeLog([]);
     try {
       setPhase(`Phase 1/2 \u2014 Decomposing into ${activeLayers.length} layer${activeLayers.length === 1 ? '' : 's'}\u2026`);
       const rawLayers = await callClaude(buildDecomposeSystem(activeLayers), 'Task/Goal:\n' + input);
@@ -227,10 +301,22 @@ export default function PromptCompiler() {
     finally { setResynthLoading(false); }
   }, [layers, input, activeLayers]);
 
+  // Build system prompt with project context
+  const buildProjectSystemPrompt = useCallback(() => {
+    let sys = synthesized;
+    if (currentHtml) {
+      sys += '\n\n<current_project_html>\n' + currentHtml + '\n</current_project_html>';
+      sys += '\n\nIMPORTANT: The user has a live project. When they ask for changes, provide the COMPLETE updated HTML document. Do not provide partial snippets \u2014 always include the full <!DOCTYPE html> to </html> so the preview can render it.';
+    }
+    if (changeLog.length > 0) {
+      sys += '\n\n<change_history>\n' + changeLog.map(c => `- ${c.text}`).join('\n') + '\n</change_history>';
+    }
+    return sys;
+  }, [synthesized, currentHtml, changeLog]);
+
   // Run compiled prompt (streaming)
   const runPrompt = useCallback(async () => {
     if (!synthesized || !input.trim()) return;
-    // Abort any in-flight stream
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -246,7 +332,7 @@ export default function PromptCompiler() {
     let accumulated = '';
     try {
       const fullText = await streamClaudeWithHistory(
-        synthesized,
+        buildProjectSystemPrompt(),
         newConvo,
         (chunk) => {
           accumulated += chunk;
@@ -254,23 +340,25 @@ export default function PromptCompiler() {
         },
         controller.signal
       );
-      // Commit final response to conversation, clear streaming
-      setConversation([userMsg, { role: 'assistant', content: fullText }]);
+      const finalConvo = [userMsg, { role: 'assistant', content: fullText }];
+      setConversation(finalConvo);
       setStreamingText('');
+      // Auto-save as project
+      saveCurrentAsProject(finalConvo, currentHtml);
     } catch (e) {
       if (e.name !== 'AbortError') setError(e.message);
-      // If we got partial text, commit it
       if (accumulated) {
-        setConversation([userMsg, { role: 'assistant', content: accumulated }]);
+        const finalConvo = [userMsg, { role: 'assistant', content: accumulated }];
+        setConversation(finalConvo);
         setStreamingText('');
       }
     } finally {
       setRunLoading(false);
       abortRef.current = null;
     }
-  }, [synthesized, input]);
+  }, [synthesized, input, buildProjectSystemPrompt, currentHtml, saveCurrentAsProject]);
 
-  // Send follow-up in conversation (streaming)
+  // Send follow-up with project context
   const sendFollowUp = useCallback(async (text) => {
     if (!text.trim() || !synthesized) return;
     if (abortRef.current) abortRef.current.abort();
@@ -287,7 +375,7 @@ export default function PromptCompiler() {
     let accumulated = '';
     try {
       const fullText = await streamClaudeWithHistory(
-        synthesized,
+        buildProjectSystemPrompt(),
         updatedConvo,
         (chunk) => {
           accumulated += chunk;
@@ -295,8 +383,20 @@ export default function PromptCompiler() {
         },
         controller.signal
       );
-      setConversation([...updatedConvo, { role: 'assistant', content: fullText }]);
+      const finalConvo = [...updatedConvo, { role: 'assistant', content: fullText }];
+      setConversation(finalConvo);
       setStreamingText('');
+
+      // Extract HTML from latest response and update project
+      const htmlMatch = fullText.match(/```html\n([\s\S]*?)```/);
+      if (htmlMatch && htmlMatch[1].includes('<!DOCTYPE')) {
+        const newHtml = htmlMatch[1].trimEnd();
+        setCurrentHtml(newHtml);
+        setChangeLog(prev => [...prev, { time: new Date().toISOString(), text: 'Updated via follow-up' }]);
+        saveCurrentAsProject(finalConvo, newHtml);
+      } else {
+        saveCurrentAsProject(finalConvo, currentHtml);
+      }
     } catch (e) {
       if (e.name !== 'AbortError') setError(e.message);
       if (accumulated) {
@@ -307,13 +407,20 @@ export default function PromptCompiler() {
       setRunLoading(false);
       abortRef.current = null;
     }
-  }, [conversation, synthesized]);
+  }, [conversation, synthesized, buildProjectSystemPrompt, currentHtml, saveCurrentAsProject]);
 
   const clearConversation = useCallback(() => {
     if (abortRef.current) abortRef.current.abort();
     setConversation([]);
     setStreamingText('');
   }, []);
+
+  // Error feedback from preview
+  const handlePreviewErrors = useCallback((errors) => {
+    if (errors.length === 0) return;
+    const errorMsg = 'The preview detected these errors:\n' + errors.map(e => `- ${e}`).join('\n') + '\n\nPlease fix these issues and provide the complete updated HTML.';
+    sendFollowUp(errorMsg);
+  }, [sendFollowUp]);
 
   const handleLayerSave = useCallback((key, draft) => {
     setLayers(prev => ({ ...prev, [key]: draft }));
@@ -331,6 +438,9 @@ export default function PromptCompiler() {
     setCopied(false);
     setConversation([]);
     setStreamingText('');
+    setCurrentProject(null);
+    setCurrentHtml('');
+    setChangeLog([]);
   }, []);
 
   const copyToClipboard = useCallback((text) => {
@@ -375,11 +485,45 @@ export default function PromptCompiler() {
                 Prompt Compiler
               </h1>
               <p className="text-gray-400 text-sm">
-                {activeLayers.length}-layer AI prompt decomposition &amp; synthesis
+                {currentProject ? (
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    Project: {currentProject.name}
+                    {projectNotice && <span className="text-emerald-400 text-xs ml-2">\u2713 {projectNotice}</span>}
+                  </span>
+                ) : (
+                  `${activeLayers.length}-layer AI prompt decomposition & synthesis`
+                )}
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {currentProject && (
+              <button
+                onClick={handleSaveVersion}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-emerald-900/30 text-emerald-400 hover:bg-emerald-900/50 transition-all border border-emerald-800/50"
+                title="Save version snapshot"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                </svg>
+                Save Version
+              </button>
+            )}
+            <button
+              onClick={() => setShowTools(true)}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-gray-800 text-gray-300 hover:bg-gray-700 transition-all"
+              title="Tools & Integrations"
+            >
+              \ud83d\udd27 Tools
+            </button>
+            <button
+              onClick={() => setShowProjects(true)}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-gray-800 text-gray-300 hover:bg-gray-700 transition-all"
+              title="Saved Projects"
+            >
+              \ud83d\udcc1 Projects
+            </button>
             <button
               onClick={() => setShowSettings(true)}
               className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-gray-800 text-gray-300 hover:bg-gray-700 transition-all"
@@ -698,6 +842,9 @@ export default function PromptCompiler() {
                 onSendFollowUp={sendFollowUp}
                 onClear={clearConversation}
                 loading={runLoading}
+                currentHtml={currentHtml}
+                onUpdateHtml={handleUpdateHtml}
+                onPreviewErrors={handlePreviewErrors}
               />
             )}
           </div>
@@ -747,6 +894,19 @@ export default function PromptCompiler() {
           existingKeys={allLayers.map(l => l.key)}
           onAdd={addCustomLayer}
           onClose={() => setShowAddLayer(false)}
+        />
+      )}
+      {showProjects && (
+        <ProjectManager
+          onLoad={loadProject}
+          onClose={() => setShowProjects(false)}
+          currentProjectId={currentProject?.id}
+        />
+      )}
+      {showTools && (
+        <ToolConfig
+          builtInTools={BUILT_IN_TOOLS}
+          onClose={() => setShowTools(false)}
         />
       )}
     </div>
